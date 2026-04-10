@@ -1,0 +1,31 @@
+{
+  "name": "rps-game",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build:frontend": "tsc -b && vite build",
+    "build:contracts": "cdm build",
+    "deploy": "cdm deploy -n paseo",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@dotdm/cdm": "latest",
+    "@polkadot-apps/bulletin": "latest",
+    "@polkadot-apps/signer": "latest",
+    "@polkadot-apps/statement-store": "latest",
+    "@novasamatech/product-sdk": "^0.6.6",
+    "@novasamatech/host-api": "^0.6.12",
+    "polkadot-api": "^1.23.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0"
+  }
+}
