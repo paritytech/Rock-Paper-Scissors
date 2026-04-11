@@ -1,10 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
     createStatementStore,
     type ProductAccountId,
-    type SignedStatement,
-    type Statement,
-    type Topic,
 } from "@novasamatech/product-sdk";
 import { blake2b256 } from "@polkadot-labs/hdkd-helpers";
 import type { Move, Round, GameData, PlayerData, RoundResult } from "../types.ts";
@@ -24,6 +21,8 @@ function stringToTopic(str: string): Uint8Array {
     return blake2b256(new TextEncoder().encode(str));
 }
 
+const store = createStatementStore();
+
 type GameMessage =
     | { type: "join"; peerId: string; timestamp: number }
     | { type: "commit"; round: number; hash: string; peerId: string; timestamp: number }
@@ -35,29 +34,24 @@ async function hashCommit(move: Move, salt: string): Promise<string> {
     return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function publishMessage(
-    store: ReturnType<typeof createStatementStore>,
-    roomCode: string,
-    channel: string,
-    msg: GameMessage,
-) {
+async function submitStatement(roomCode: string, channel: string, msg: GameMessage) {
     const data = new TextEncoder().encode(JSON.stringify(msg));
     const expiryTimestampSecs = Math.floor(Date.now() / 1000) + 600;
-    const sequenceNumber = Date.now() % 0xFFFFFFFF;
-    const expiry = (BigInt(expiryTimestampSecs) << BigInt(32)) | BigInt(sequenceNumber);
+    const seq = Date.now() % 0xFFFFFFFF;
+    const expiry = (BigInt(expiryTimestampSecs) << BigInt(32)) | BigInt(seq);
 
-    const statement: Statement = {
+    const statement = {
         proof: undefined,
         decryptionKey: stringToTopic(roomCode),
         expiry,
         channel: stringToTopic(channel),
-        topics: [stringToTopic(APP_TOPIC), stringToTopic(roomCode)] as unknown as Topic[],
+        topics: [stringToTopic(APP_TOPIC), stringToTopic(roomCode)],
         data,
-    } as unknown as Statement;
+    };
 
-    const proof = await store.createProof(ACCOUNT_ID, statement);
-    const signed: SignedStatement = { ...statement, proof } as unknown as SignedStatement;
-    await store.submit(signed);
+    const proof = await store.createProof(ACCOUNT_ID, statement as any);
+    await store.submit({ ...statement, proof } as any);
+    console.log("[MPGame] Submitted:", msg.type, "round:", (msg as any).round ?? "-");
 }
 
 export default function MultiplayerGame({ account, roomCode, isCreator, onDone }: {
@@ -67,27 +61,37 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
     onDone: () => void;
 }) {
     const myId = account.h160Address;
-    console.log("[MPGame] Init — room:", roomCode, "isCreator:", isCreator, "myId:", myId);
 
     const [phase, setPhase] = useState<"connecting" | "pick" | "waiting-commit" | "waiting-reveal" | "round-result" | "game-over">("connecting");
     const [round, setRound] = useState(1);
     const [rounds, setRounds] = useState<Round[]>([]);
-    const [myMove, setMyMove] = useState<Move | null>(null);
-    const [mySalt, setMySalt] = useState("");
-    const [opponentCommit, setOpponentCommit] = useState<string | null>(null);
     const [currentRoundResult, setCurrentRoundResult] = useState<Round | null>(null);
     const [timer, setTimer] = useState(PHASE_TIMEOUT);
     const [saving, setSaving] = useState(false);
     const [statusMsg, setStatusMsg] = useState("");
+    // Display-only state for picked move
+    const [pickedMove, setPickedMove] = useState<Move | null>(null);
 
-    const storeRef = useRef<ReturnType<typeof createStatementStore> | null>(null);
+    // Use refs for game state accessed in callbacks (avoids stale closures)
+    const myMoveRef = useRef<Move | null>(null);
+    const mySaltRef = useRef<string>("");
+    const opponentCommitRef = useRef<string | null>(null);
+    const roundRef = useRef(1);
+    const phaseRef = useRef<string>("connecting");
+    const roundsRef = useRef<Round[]>([]);
     const subRef = useRef<{ unsubscribe: () => void } | null>(null);
     const opponentIdRef = useRef<string | null>(null);
+    // Dedup: track processed messages by key
+    const seenRef = useRef<Set<string>>(new Set());
+
+    // Keep refs in sync
+    useEffect(() => { phaseRef.current = phase; }, [phase]);
+    useEffect(() => { roundRef.current = round; }, [round]);
+    useEffect(() => { roundsRef.current = rounds; }, [rounds]);
 
     // Timer
     useEffect(() => {
         if (phase !== "pick" && phase !== "waiting-commit" && phase !== "waiting-reveal") return;
-        console.log("[MPGame] Timer started for phase:", phase, "round:", round);
         setTimer(PHASE_TIMEOUT);
         const interval = setInterval(() => {
             setTimer(t => {
@@ -98,126 +102,120 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
         return () => clearInterval(interval);
     }, [phase, round]);
 
-    const handleMessage = useCallback((msg: GameMessage) => {
-        console.log("[MPGame] Received message:", msg);
+    function processRoundResult(myMove: Move, opponentMove: Move) {
+        const result = determineWinner(myMove, opponentMove);
+        console.log("[MPGame] Round result:", myMove, "vs", opponentMove, "=", result);
+        const roundData: Round = { playerMove: myMove, opponentMove, result };
+
+        setCurrentRoundResult(roundData);
+        const newRounds = [...roundsRef.current, roundData];
+        setRounds(newRounds);
+        roundsRef.current = newRounds;
+
+        const w = newRounds.filter(r => r.result === "win").length;
+        const l = newRounds.filter(r => r.result === "loss").length;
+        const needed = Math.ceil(BEST_OF / 2);
+        console.log("[MPGame] Score:", w, "-", l, "needed:", needed);
+
+        setPhase("round-result");
+
+        setTimeout(() => {
+            if (w >= needed || l >= needed || newRounds.length >= BEST_OF) {
+                console.log("[MPGame] Game over!");
+                setPhase("game-over");
+            } else {
+                const nextRound = newRounds.length + 1;
+                console.log("[MPGame] Next round:", nextRound);
+                setRound(nextRound);
+                roundRef.current = nextRound;
+                myMoveRef.current = null;
+                mySaltRef.current = "";
+                opponentCommitRef.current = null;
+                setPickedMove(null);
+                setCurrentRoundResult(null);
+                setPhase("pick");
+            }
+        }, 2000);
+    }
+
+    function handleMessage(msg: GameMessage) {
+        // Dedup by type+round+peerId
+        const dedupKey = `${msg.type}-${(msg as any).round ?? 0}-${msg.peerId}-${msg.timestamp}`;
+        if (seenRef.current.has(dedupKey)) {
+            console.log("[MPGame] Dedup skip:", dedupKey);
+            return;
+        }
+        seenRef.current.add(dedupKey);
+
+        console.log("[MPGame] Processing:", msg.type, "from:", msg.peerId);
 
         if (msg.type === "join" && msg.peerId !== myId) {
-            console.log("[MPGame] Opponent joined:", msg.peerId);
             opponentIdRef.current = msg.peerId;
         }
 
         if (msg.type === "commit" && msg.peerId !== myId) {
-            console.log("[MPGame] Opponent committed round", msg.round, "hash:", msg.hash);
-            setOpponentCommit(msg.hash);
-            setPhase(prev => {
-                const next = prev === "waiting-commit" ? "waiting-reveal" : prev;
-                console.log("[MPGame] Phase transition on opponent commit:", prev, "->", next);
-                return next;
-            });
+            console.log("[MPGame] Opponent commit round", msg.round, "hash:", msg.hash);
+            opponentCommitRef.current = msg.hash;
+
+            if (phaseRef.current === "waiting-commit") {
+                // We already committed, now both committed — auto-reveal
+                setPhase("waiting-reveal");
+                phaseRef.current = "waiting-reveal";
+
+                if (myMoveRef.current && mySaltRef.current) {
+                    submitStatement(roomCode, `${roomCode}/reveal/${roundRef.current}/${myId}`, {
+                        type: "reveal", round: roundRef.current, move: myMoveRef.current,
+                        salt: mySaltRef.current, peerId: myId, timestamp: Date.now(),
+                    });
+                }
+            }
         }
 
         if (msg.type === "reveal" && msg.peerId !== myId) {
-            console.log("[MPGame] Opponent revealed round", msg.round, "move:", msg.move);
-            setMyMove(currentMyMove => {
-                setOpponentCommit(currentOpponentCommit => {
-                    if (!currentMyMove || !currentOpponentCommit) {
-                        console.warn("[MPGame] Cannot process reveal — missing data");
-                        return currentOpponentCommit;
-                    }
+            console.log("[MPGame] Opponent reveal round", msg.round, "move:", msg.move);
 
-                    hashCommit(msg.move, msg.salt).then(expectedHash => {
-                        console.log("[MPGame] Verifying hash — expected:", expectedHash, "got:", currentOpponentCommit);
-                        if (expectedHash !== currentOpponentCommit) {
-                            console.error("[MPGame] HASH MISMATCH!");
-                            setStatusMsg("Opponent's move didn't match their commit!");
-                            return;
-                        }
+            const myMove = myMoveRef.current;
+            const theirCommit = opponentCommitRef.current;
 
-                        const result = determineWinner(currentMyMove, msg.move);
-                        console.log("[MPGame] Round result:", currentMyMove, "vs", msg.move, "=", result);
-                        const roundData: Round = { playerMove: currentMyMove, opponentMove: msg.move, result };
+            if (!myMove) {
+                console.warn("[MPGame] Got reveal but no myMove yet");
+                return;
+            }
+            if (!theirCommit) {
+                console.warn("[MPGame] Got reveal but no opponent commit");
+                return;
+            }
 
-                        setCurrentRoundResult(roundData);
-                        setRounds(prev => {
-                            const newRounds = [...prev, roundData];
-                            const w = newRounds.filter(r => r.result === "win").length;
-                            const l = newRounds.filter(r => r.result === "loss").length;
-                            const needed = Math.ceil(BEST_OF / 2);
-                            console.log("[MPGame] Score:", w, "-", l);
-
-                            setTimeout(() => {
-                                if (w >= needed || l >= needed || newRounds.length >= BEST_OF) {
-                                    console.log("[MPGame] Game over!");
-                                    setPhase("game-over");
-                                } else {
-                                    setRound(newRounds.length + 1);
-                                    setMyMove(null);
-                                    setMySalt("");
-                                    setOpponentCommit(null);
-                                    setCurrentRoundResult(null);
-                                    setPhase("pick");
-                                }
-                            }, 2000);
-                            return newRounds;
-                        });
-                        setPhase("round-result");
-                    });
-
-                    return currentOpponentCommit;
-                });
-                return currentMyMove;
+            // Verify hash
+            hashCommit(msg.move, msg.salt).then(expectedHash => {
+                if (expectedHash !== theirCommit) {
+                    console.error("[MPGame] HASH MISMATCH!", expectedHash, "vs", theirCommit);
+                    setStatusMsg("Opponent cheated!");
+                    return;
+                }
+                console.log("[MPGame] Hash OK");
+                processRoundResult(myMove, msg.move);
             });
         }
-    }, [myId]);
+    }
 
-    // Connect and setup
+    // Subscribe + join
     useEffect(() => {
         let destroyed = false;
 
         (async () => {
             try {
-                console.log("[MPGame] Creating store via product-sdk...");
-                const store = createStatementStore();
-                storeRef.current = store;
-
-                // Subscribe
-                const topics: Topic[] = [
-                    stringToTopic(APP_TOPIC),
-                    stringToTopic(roomCode),
-                ] as unknown as Topic[];
-
+                const topics = [stringToTopic(APP_TOPIC), stringToTopic(roomCode)];
                 console.log("[MPGame] Subscribing to room:", roomCode);
-                subRef.current = store.subscribe(topics, (statements: SignedStatement[]) => {
+
+                subRef.current = store.subscribe(topics as any, (statements: any[]) => {
                     if (destroyed) return;
-                    console.log("[MPGame] Subscribe callback — got", statements.length, "statement(s)");
                     for (const stmt of statements) {
                         try {
-                            const raw = stmt as any;
-                            const dataField = raw.data;
-                            console.log("[MPGame] data type:", typeof dataField, "isUint8:", dataField instanceof Uint8Array, "length:", dataField?.length);
-
-                            let text: string;
-                            if (typeof dataField === "string") {
-                                text = dataField;
-                            } else if (dataField instanceof Uint8Array) {
-                                text = new TextDecoder().decode(dataField);
-                            } else if (Array.isArray(dataField) || dataField?.buffer) {
-                                text = new TextDecoder().decode(new Uint8Array(dataField));
-                            } else {
-                                console.warn("[MPGame] Unknown data format:", dataField);
-                                continue;
-                            }
-
-                            console.log("[MPGame] Decoded:", text);
+                            if (!stmt.data) continue;
+                            const text = new TextDecoder().decode(stmt.data);
                             const msg: GameMessage = JSON.parse(text);
-
-                            // Skip own messages
-                            if (msg.peerId === myId) {
-                                console.log("[MPGame] Skipping own message:", msg.type);
-                                continue;
-                            }
-
-                            console.log("[MPGame] >>> Opponent:", msg.type, msg);
+                            if (msg.peerId === myId) continue;
                             handleMessage(msg);
                         } catch (e) {
                             console.warn("[MPGame] Parse error:", e);
@@ -225,61 +223,55 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
                     }
                 });
 
-                // Publish join
                 console.log("[MPGame] Publishing join...");
-                await publishMessage(store, roomCode, `${roomCode}/presence/${myId}`, {
+                await submitStatement(roomCode, `${roomCode}/presence/${myId}`, {
                     type: "join", peerId: myId, timestamp: Date.now(),
                 });
-                console.log("[MPGame] Join published, ready to play");
 
-                if (!destroyed) setPhase("pick");
+                if (!destroyed) {
+                    setPhase("pick");
+                    phaseRef.current = "pick";
+                }
             } catch (err) {
-                console.error("[MPGame] Connect error:", err);
-                setStatusMsg("Connection failed — " + (err instanceof Error ? err.message : "unknown"));
+                console.error("[MPGame] Error:", err);
+                setStatusMsg("Connection failed");
             }
         })();
 
         return () => {
             destroyed = true;
-            console.log("[MPGame] Cleanup");
             subRef.current?.unsubscribe();
         };
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
     const pickMove = async (move: Move) => {
-        if (phase !== "pick" || !storeRef.current) return;
+        if (phaseRef.current !== "pick") return;
 
         const salt = crypto.randomUUID();
         const hash = await hashCommit(move, salt);
         console.log("[MPGame] Picked:", move, "hash:", hash);
 
-        setMyMove(move);
-        setMySalt(salt);
+        myMoveRef.current = move;
+        mySaltRef.current = salt;
+        setPickedMove(move);
 
-        console.log("[MPGame] Publishing commit round", round);
-        await publishMessage(storeRef.current, roomCode, `${roomCode}/commit/${round}/${myId}`, {
-            type: "commit", round, hash, peerId: myId, timestamp: Date.now(),
+        await submitStatement(roomCode, `${roomCode}/commit/${roundRef.current}/${myId}`, {
+            type: "commit", round: roundRef.current, hash, peerId: myId, timestamp: Date.now(),
         });
 
-        if (opponentCommit) {
-            console.log("[MPGame] Opponent already committed — auto-revealing");
+        if (opponentCommitRef.current) {
+            // Opponent already committed — go straight to reveal
+            console.log("[MPGame] Opponent already committed, revealing...");
             setPhase("waiting-reveal");
-            await publishMessage(storeRef.current, roomCode, `${roomCode}/reveal/${round}/${myId}`, {
-                type: "reveal", round, move, salt, peerId: myId, timestamp: Date.now(),
+            phaseRef.current = "waiting-reveal";
+            await submitStatement(roomCode, `${roomCode}/reveal/${roundRef.current}/${myId}`, {
+                type: "reveal", round: roundRef.current, move, salt, peerId: myId, timestamp: Date.now(),
             });
         } else {
             setPhase("waiting-commit");
+            phaseRef.current = "waiting-commit";
         }
     };
-
-    // Auto-reveal
-    useEffect(() => {
-        if (phase !== "waiting-reveal" || !myMove || !mySalt || !storeRef.current) return;
-        console.log("[MPGame] Auto-reveal round", round);
-        publishMessage(storeRef.current, roomCode, `${roomCode}/reveal/${round}/${myId}`, {
-            type: "reveal", round, move: myMove, salt: mySalt, peerId: myId, timestamp: Date.now(),
-        });
-    }, [phase]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const playerWins = rounds.filter(r => r.result === "win").length;
     const opponentWins = rounds.filter(r => r.result === "loss").length;
@@ -288,20 +280,15 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
 
     const saveToChain = async () => {
         setSaving(true);
-        console.log("[MPGame] Saving to chain...");
         try {
             const lb = getContract();
             if (!lb) { setStatusMsg("Contract not available"); setSaving(false); return; }
 
-            setStatusMsg("Fetching existing history...");
             let playerData: PlayerData = {
                 player: myId, totalGames: 0, wins: 0, losses: 0, draws: 0, points: 0, games: [],
             };
-
             try {
-                console.log("[Contract] Querying CID for", myId);
                 const cidRes = await lb.getPlayerCid.query(myId);
-                console.log("[Contract] getPlayerCid:", cidRes);
                 if (cidRes.success && cidRes.value) {
                     const resp = await fetch(IPFS_GATEWAY + cidRes.value);
                     if (resp.ok) playerData = await resp.json();
@@ -309,16 +296,11 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
             } catch { /* first time */ }
 
             const game: GameData = {
-                id: playerData.games.length + 1,
-                mode: "multiplayer",
-                opponent: opponentIdRef.current ?? "unknown",
-                roomCode,
-                rounds,
-                result: overallResult,
-                pointsChange: pts,
+                id: playerData.games.length + 1, mode: "multiplayer",
+                opponent: opponentIdRef.current ?? "unknown", roomCode, rounds,
+                result: overallResult, pointsChange: pts,
                 timestamp: Math.floor(Date.now() / 1000),
             };
-
             playerData.games.push(game);
             playerData.totalGames++;
             if (overallResult === "win") playerData.wins++;
@@ -327,46 +309,23 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
             playerData.points += pts;
 
             setStatusMsg("Uploading to Bulletin...");
-            const bytes = new TextEncoder().encode(JSON.stringify(playerData));
-            const newCid = await uploadToBulletin(bytes);
-            console.log("[Bulletin] New CID:", newCid);
-
-            setStatusMsg("Ensuring account mapping...");
+            const newCid = await uploadToBulletin(new TextEncoder().encode(JSON.stringify(playerData)));
             await ensureMapping(account);
-
-            console.log("[Contract] Checking registration...");
             const regRes = await lb.isRegistered.query(myId);
-            console.log("[Contract] isRegistered:", regRes);
             if (regRes.success && !regRes.value) {
-                setStatusMsg("Registering player...");
-                const regTx = await withTimeout(
-                    lb.register.tx({ signer: account.getSigner(), origin: account.address }),
-                    120_000, "register.tx",
-                );
-                console.log("[Contract] register.tx:", regTx);
+                setStatusMsg("Registering...");
+                await withTimeout(lb.register.tx({ signer: account.getSigner(), origin: account.address }), 120_000, "register");
             }
-
             setStatusMsg("Updating leaderboard...");
-            console.log("[Contract] updateResult.tx CID:", newCid, "pts:", pts);
-            const updateTx = await withTimeout(
-                lb.updateResult.tx(newCid, BigInt(pts), { signer: account.getSigner(), origin: account.address }),
-                120_000, "updateResult.tx",
-            );
-            console.log("[Contract] updateResult.tx:", updateTx);
-
+            await withTimeout(lb.updateResult.tx(newCid, BigInt(pts), { signer: account.getSigner(), origin: account.address }), 120_000, "update");
             setStatusMsg("Saved!");
-            console.log("[Contract] All saved!");
         } catch (err) {
             console.error("[MPGame] Save error:", err);
-            setStatusMsg("Failed to save - check console");
-        } finally {
-            setSaving(false);
-        }
+            setStatusMsg("Failed - check console");
+        } finally { setSaving(false); }
     };
 
-    if (phase === "connecting") {
-        return <div className="spinner">Connecting to game room...</div>;
-    }
+    if (phase === "connecting") return <div className="spinner">Connecting to game room...</div>;
 
     return (
         <div className="mp-game">
@@ -385,17 +344,13 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
                 <div>Opponent: <span>{opponentWins}</span></div>
             </div>
 
-            {(phase === "pick" || phase === "waiting-commit") && (
-                <div className="timer">{timer}s</div>
-            )}
+            {(phase === "pick" || phase === "waiting-commit") && <div className="timer">{timer}s</div>}
 
             {phase === "pick" && (
                 <div className="move-picker">
                     {(["rock", "paper", "scissors"] as Move[]).map(m => (
                         <div key={m}>
-                            <button className="move-btn" onClick={() => pickMove(m)}>
-                                {MOVE_EMOJI[m]}
-                            </button>
+                            <button className="move-btn" onClick={() => pickMove(m)}>{MOVE_EMOJI[m]}</button>
                             <div className="move-label">{m}</div>
                         </div>
                     ))}
@@ -404,14 +359,12 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
 
             {phase === "waiting-commit" && (
                 <div className="waiting-opponent">
-                    <div style={{ fontSize: 48, marginBottom: 8 }}>{myMove ? MOVE_EMOJI[myMove] : ""}</div>
-                    <div>You picked {myMove}. Waiting for opponent...</div>
+                    <div style={{ fontSize: 48, marginBottom: 8 }}>{pickedMove ? MOVE_EMOJI[pickedMove] : ""}</div>
+                    <div>You picked {pickedMove}. Waiting for opponent...</div>
                 </div>
             )}
 
-            {phase === "waiting-reveal" && (
-                <div className="waiting-opponent">Verifying moves...</div>
-            )}
+            {phase === "waiting-reveal" && <div className="waiting-opponent">Revealing moves...</div>}
 
             {phase === "round-result" && currentRoundResult && (
                 <div className="round-result">
@@ -439,17 +392,12 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
                     <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 16 }}>
                         {playerWins} - {opponentWins} ({pts > 0 ? `+${pts}` : pts} pts)
                     </div>
-
                     <div className="history-card-rounds" style={{ justifyContent: "center", marginBottom: 16 }}>
                         {rounds.map((r, i) => (
-                            <span key={i} className="round-badge">
-                                {MOVE_EMOJI[r.playerMove]} vs {MOVE_EMOJI[r.opponentMove]}
-                            </span>
+                            <span key={i} className="round-badge">{MOVE_EMOJI[r.playerMove]} vs {MOVE_EMOJI[r.opponentMove]}</span>
                         ))}
                     </div>
-
                     {statusMsg && <div className="status">{statusMsg}</div>}
-
                     <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
                         <button className="btn btn-primary" onClick={saveToChain} disabled={saving}>
                             {saving ? "Saving..." : "Save to Chain"}
