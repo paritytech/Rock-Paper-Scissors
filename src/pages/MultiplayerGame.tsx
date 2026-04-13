@@ -1,9 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import {
-    createStatementStore,
-    type ProductAccountId,
-} from "@novasamatech/product-sdk";
-import { blake2b256 } from "@polkadot-labs/hdkd-helpers";
+import { StatementStoreClient } from "@polkadot-apps/statement-store";
 import type { Move, Round, GameData, PlayerData, RoundResult } from "../types.ts";
 import {
     determineWinner, pointsForResult,
@@ -14,14 +10,7 @@ import {
 const MOVE_EMOJI: Record<Move, string> = { rock: "\u270A", paper: "\u270B", scissors: "\u2702\uFE0F" };
 const BEST_OF = 3;
 const PHASE_TIMEOUT = 30;
-const APP_TOPIC = "rps-game";
-const ACCOUNT_ID: ProductAccountId = ["rps-game.dot", 0];
-
-function stringToTopic(str: string): Uint8Array {
-    return blake2b256(new TextEncoder().encode(str));
-}
-
-const store = createStatementStore();
+const APP_NAME = "rps-game";
 
 type GameMessage =
     | { type: "join"; peerId: string; timestamp: number }
@@ -32,26 +21,6 @@ async function hashCommit(move: Move, salt: string): Promise<string> {
     const data = new TextEncoder().encode(move + salt);
     const hash = await crypto.subtle.digest("SHA-256", data);
     return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
-async function submitStatement(roomCode: string, channel: string, msg: GameMessage) {
-    const data = new TextEncoder().encode(JSON.stringify(msg));
-    const expiryTimestampSecs = Math.floor(Date.now() / 1000) + 600;
-    const seq = Date.now() % 0xFFFFFFFF;
-    const expiry = (BigInt(expiryTimestampSecs) << BigInt(32)) | BigInt(seq);
-
-    const statement = {
-        proof: undefined,
-        decryptionKey: stringToTopic(roomCode),
-        expiry,
-        channel: stringToTopic(channel),
-        topics: [stringToTopic(APP_TOPIC), stringToTopic(roomCode)],
-        data,
-    };
-
-    const proof = await store.createProof(ACCOUNT_ID, statement as any);
-    await store.submit({ ...statement, proof } as any);
-    console.log("[MPGame] Submitted:", msg.type, "round:", (msg as any).round ?? "-");
 }
 
 export default function MultiplayerGame({ account, roomCode, isCreator, onDone }: {
@@ -69,20 +38,17 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
     const [timer, setTimer] = useState(PHASE_TIMEOUT);
     const [saving, setSaving] = useState(false);
     const [statusMsg, setStatusMsg] = useState("");
-    // Display-only state for picked move
     const [pickedMove, setPickedMove] = useState<Move | null>(null);
 
-    // Use refs for game state accessed in callbacks (avoids stale closures)
+    // Refs for game state accessed in subscribe callback (avoid stale closures)
+    const clientRef = useRef<StatementStoreClient | null>(null);
     const myMoveRef = useRef<Move | null>(null);
     const mySaltRef = useRef<string>("");
     const opponentCommitRef = useRef<string | null>(null);
     const roundRef = useRef(1);
     const phaseRef = useRef<string>("connecting");
     const roundsRef = useRef<Round[]>([]);
-    const subRef = useRef<{ unsubscribe: () => void } | null>(null);
     const opponentIdRef = useRef<string | null>(null);
-    // Dedup: track processed messages by key
-    const seenRef = useRef<Set<string>>(new Set());
 
     // Keep refs in sync
     useEffect(() => { phaseRef.current = phase; }, [phase]);
@@ -115,17 +81,14 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
         const w = newRounds.filter(r => r.result === "win").length;
         const l = newRounds.filter(r => r.result === "loss").length;
         const needed = Math.ceil(BEST_OF / 2);
-        console.log("[MPGame] Score:", w, "-", l, "needed:", needed);
 
         setPhase("round-result");
 
         setTimeout(() => {
             if (w >= needed || l >= needed || newRounds.length >= BEST_OF) {
-                console.log("[MPGame] Game over!");
                 setPhase("game-over");
             } else {
                 const nextRound = newRounds.length + 1;
-                console.log("[MPGame] Next round:", nextRound);
                 setRound(nextRound);
                 roundRef.current = nextRound;
                 myMoveRef.current = null;
@@ -139,14 +102,6 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
     }
 
     function handleMessage(msg: GameMessage) {
-        // Dedup by type+round+peerId
-        const dedupKey = `${msg.type}-${(msg as any).round ?? 0}-${msg.peerId}-${msg.timestamp}`;
-        if (seenRef.current.has(dedupKey)) {
-            console.log("[MPGame] Dedup skip:", dedupKey);
-            return;
-        }
-        seenRef.current.add(dedupKey);
-
         console.log("[MPGame] Processing:", msg.type, "from:", msg.peerId);
 
         if (msg.type === "join" && msg.peerId !== myId) {
@@ -154,19 +109,18 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
         }
 
         if (msg.type === "commit" && msg.peerId !== myId) {
-            console.log("[MPGame] Opponent commit round", msg.round, "hash:", msg.hash);
+            console.log("[MPGame] Opponent commit round", msg.round);
             opponentCommitRef.current = msg.hash;
 
-            if (phaseRef.current === "waiting-commit") {
-                // We already committed, now both committed — auto-reveal
+            if (phaseRef.current === "waiting-commit" && clientRef.current) {
                 setPhase("waiting-reveal");
                 phaseRef.current = "waiting-reveal";
 
                 if (myMoveRef.current && mySaltRef.current) {
-                    submitStatement(roomCode, `${roomCode}/reveal/${roundRef.current}/${myId}`, {
-                        type: "reveal", round: roundRef.current, move: myMoveRef.current,
-                        salt: mySaltRef.current, peerId: myId, timestamp: Date.now(),
-                    });
+                    clientRef.current.publish<GameMessage>(
+                        { type: "reveal", round: roundRef.current, move: myMoveRef.current, salt: mySaltRef.current, peerId: myId, timestamp: Date.now() },
+                        { channel: `${roomCode}/reveal/${roundRef.current}/${myId}`, topic2: roomCode },
+                    );
                 }
             }
         }
@@ -177,56 +131,52 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
             const myMove = myMoveRef.current;
             const theirCommit = opponentCommitRef.current;
 
-            if (!myMove) {
-                console.warn("[MPGame] Got reveal but no myMove yet");
-                return;
-            }
-            if (!theirCommit) {
-                console.warn("[MPGame] Got reveal but no opponent commit");
-                return;
-            }
+            if (!myMove) { console.warn("[MPGame] No myMove yet"); return; }
+            if (!theirCommit) { console.warn("[MPGame] No opponent commit"); return; }
 
-            // Verify hash
             hashCommit(msg.move, msg.salt).then(expectedHash => {
                 if (expectedHash !== theirCommit) {
-                    console.error("[MPGame] HASH MISMATCH!", expectedHash, "vs", theirCommit);
+                    console.error("[MPGame] HASH MISMATCH!");
                     setStatusMsg("Opponent cheated!");
                     return;
                 }
-                console.log("[MPGame] Hash OK");
                 processRoundResult(myMove, msg.move);
             });
         }
     }
 
-    // Subscribe + join
+    // Connect + subscribe + publish join
     useEffect(() => {
         let destroyed = false;
 
         (async () => {
             try {
-                const topics = [stringToTopic(APP_TOPIC), stringToTopic(roomCode)];
-                console.log("[MPGame] Subscribing to room:", roomCode);
+                const client = new StatementStoreClient({
+                    appName: APP_NAME,
+                    defaultTtlSeconds: 600,
+                });
+                clientRef.current = client;
 
-                subRef.current = store.subscribe(topics as any, (statements: any[]) => {
+                console.log("[MPGame] Connecting in host mode...");
+                await client.connect({
+                    mode: "host",
+                    accountId: ["rps-game.dot", 0],
+                });
+                console.log("[MPGame] Connected");
+
+                // Subscribe with built-in dedup
+                client.subscribe<GameMessage>((stmt) => {
                     if (destroyed) return;
-                    for (const stmt of statements) {
-                        try {
-                            if (!stmt.data) continue;
-                            const text = new TextDecoder().decode(stmt.data);
-                            const msg: GameMessage = JSON.parse(text);
-                            if (msg.peerId === myId) continue;
-                            handleMessage(msg);
-                        } catch (e) {
-                            console.warn("[MPGame] Parse error:", e);
-                        }
-                    }
-                });
+                    if (stmt.data.peerId === myId) return; // skip own
+                    handleMessage(stmt.data);
+                }, { topic2: roomCode });
 
+                // Publish join
                 console.log("[MPGame] Publishing join...");
-                await submitStatement(roomCode, `${roomCode}/presence/${myId}`, {
-                    type: "join", peerId: myId, timestamp: Date.now(),
-                });
+                await client.publish<GameMessage>(
+                    { type: "join", peerId: myId, timestamp: Date.now() },
+                    { channel: `${roomCode}/presence/${myId}`, topic2: roomCode },
+                );
 
                 if (!destroyed) {
                     setPhase("pick");
@@ -240,33 +190,35 @@ export default function MultiplayerGame({ account, roomCode, isCreator, onDone }
 
         return () => {
             destroyed = true;
-            subRef.current?.unsubscribe();
+            clientRef.current?.destroy();
+            clientRef.current = null;
         };
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
     const pickMove = async (move: Move) => {
-        if (phaseRef.current !== "pick") return;
+        if (phaseRef.current !== "pick" || !clientRef.current) return;
 
         const salt = crypto.randomUUID();
         const hash = await hashCommit(move, salt);
-        console.log("[MPGame] Picked:", move, "hash:", hash);
+        console.log("[MPGame] Picked:", move);
 
         myMoveRef.current = move;
         mySaltRef.current = salt;
         setPickedMove(move);
 
-        await submitStatement(roomCode, `${roomCode}/commit/${roundRef.current}/${myId}`, {
-            type: "commit", round: roundRef.current, hash, peerId: myId, timestamp: Date.now(),
-        });
+        await clientRef.current.publish<GameMessage>(
+            { type: "commit", round: roundRef.current, hash, peerId: myId, timestamp: Date.now() },
+            { channel: `${roomCode}/commit/${roundRef.current}/${myId}`, topic2: roomCode },
+        );
 
         if (opponentCommitRef.current) {
-            // Opponent already committed — go straight to reveal
             console.log("[MPGame] Opponent already committed, revealing...");
             setPhase("waiting-reveal");
             phaseRef.current = "waiting-reveal";
-            await submitStatement(roomCode, `${roomCode}/reveal/${roundRef.current}/${myId}`, {
-                type: "reveal", round: roundRef.current, move, salt, peerId: myId, timestamp: Date.now(),
-            });
+            await clientRef.current.publish<GameMessage>(
+                { type: "reveal", round: roundRef.current, move, salt, peerId: myId, timestamp: Date.now() },
+                { channel: `${roomCode}/reveal/${roundRef.current}/${myId}`, topic2: roomCode },
+            );
         } else {
             setPhase("waiting-commit");
             phaseRef.current = "waiting-commit";

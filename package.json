@@ -12,11 +12,11 @@
   },
   "dependencies": {
     "@dotdm/cdm": "latest",
+    "@novasamatech/host-api": "^0.6.12",
+    "@novasamatech/product-sdk": "^0.6.6",
     "@polkadot-apps/bulletin": "latest",
     "@polkadot-apps/signer": "latest",
-    "@polkadot-apps/statement-store": "latest",
-    "@novasamatech/product-sdk": "^0.6.6",
-    "@novasamatech/host-api": "^0.6.12",
+    "@polkadot-apps/statement-store": "^0.3.1",
     "polkadot-api": "^1.23.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
