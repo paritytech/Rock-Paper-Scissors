@@ -1,9 +1,8 @@
 import { useState } from "react";
-import type { Move, Round, GameData, PlayerData, RoundResult } from "../types.ts";
+import type { Move, Round, RoundResult } from "../types.ts";
 import {
     determineWinner, pointsForResult, randomMove,
-    uploadToBulletin, ensureMapping, getContract, withTimeout,
-    IPFS_GATEWAY, short,
+    appendGame,
 } from "../utils.ts";
 
 const MOVE_EMOJI: Record<Move, string> = { rock: "\u270A", paper: "\u270B", scissors: "\u2702\uFE0F" };
@@ -11,18 +10,20 @@ const RESULT_TEXT: Record<RoundResult, string> = { win: "You win!", loss: "You l
 const BEST_OF = 3;
 
 export default function SoloGame({ account, onDone }: {
-    account: { address: string; h160Address: string; getSigner: () => any };
+    account: { address: string };
     onDone: () => void;
 }) {
     const [rounds, setRounds] = useState<Round[]>([]);
     const [currentRound, setCurrentRound] = useState<Round | null>(null);
     const [gameOver, setGameOver] = useState(false);
-    const [saving, setSaving] = useState(false);
-    const [statusMsg, setStatusMsg] = useState("");
+    const [saved, setSaved] = useState(false);
 
     const playerWins = rounds.filter(r => r.result === "win").length;
     const computerWins = rounds.filter(r => r.result === "loss").length;
     const roundNumber = rounds.length + 1;
+
+    const overallResult: RoundResult = playerWins > computerWins ? "win" : computerWins > playerWins ? "loss" : "draw";
+    const pts = pointsForResult(overallResult);
 
     const pickMove = (move: Move) => {
         if (currentRound || gameOver) return;
@@ -44,105 +45,18 @@ export default function SoloGame({ account, onDone }: {
 
             if (w >= needed || l >= needed || newRounds.length >= BEST_OF) {
                 setGameOver(true);
+                // Auto-save to localStorage
+                const finalResult: RoundResult = w > l ? "win" : l > w ? "loss" : "draw";
+                const finalPts = pointsForResult(finalResult);
+                appendGame(account.address, {
+                    rounds: newRounds,
+                    result: finalResult,
+                    pointsChange: finalPts,
+                    timestamp: Math.floor(Date.now() / 1000),
+                });
+                setSaved(true);
             }
         }, 1500);
-    };
-
-    const overallResult: RoundResult = playerWins > computerWins ? "win" : computerWins > playerWins ? "loss" : "draw";
-    const pts = pointsForResult(overallResult);
-
-    const saveToChain = async () => {
-        setSaving(true);
-        try {
-            const lb = getContract();
-            if (!lb) {
-                setStatusMsg("Contract not available (deploy first)");
-                setSaving(false);
-                return;
-            }
-
-            // Build player data
-            setStatusMsg("Fetching existing history...");
-            let playerData: PlayerData = {
-                player: account.h160Address,
-                totalGames: 0, wins: 0, losses: 0, draws: 0, points: 0,
-                games: [],
-            };
-
-            // Try to load existing data
-            try {
-                console.log("[Contract] Querying existing CID for", account.h160Address);
-                const cidRes = await lb.getPlayerCid.query(account.h160Address);
-                console.log("[Contract] getPlayerCid result:", cidRes);
-                if (cidRes.success && cidRes.value) {
-                    const resp = await fetch(IPFS_GATEWAY + cidRes.value);
-                    if (resp.ok) playerData = await resp.json();
-                }
-            } catch { /* first time player */ }
-
-            const game: GameData = {
-                id: playerData.games.length + 1,
-                mode: "solo",
-                opponent: "computer",
-                rounds,
-                result: overallResult,
-                pointsChange: pts,
-                timestamp: Math.floor(Date.now() / 1000),
-            };
-
-            playerData.games.push(game);
-            playerData.totalGames++;
-            if (overallResult === "win") playerData.wins++;
-            else if (overallResult === "loss") playerData.losses++;
-            else playerData.draws++;
-            playerData.points += pts;
-
-            // Upload to Bulletin
-            setStatusMsg("Uploading to Bulletin...");
-            const bytes = new TextEncoder().encode(JSON.stringify(playerData));
-            const newCid = await uploadToBulletin(bytes);
-            console.log("[Bulletin] New CID:", newCid);
-
-            // Ensure mapping
-            setStatusMsg("Ensuring account mapping...");
-            await ensureMapping(account);
-            console.log("[Contract] Account mapping ensured");
-
-            // Register if needed
-            console.log("[Contract] Checking registration...");
-            const regRes = await lb.isRegistered.query(account.h160Address);
-            console.log("[Contract] isRegistered:", regRes);
-            if (regRes.success && !regRes.value) {
-                setStatusMsg("Registering player...");
-                console.log("[Contract] Registering player...");
-                const regTx = await withTimeout(
-                    lb.register.tx({ signer: account.getSigner(), origin: account.address }),
-                    120_000, "register.tx",
-                );
-                console.log("[Contract] register.tx result:", regTx);
-            }
-
-            // Update result
-            setStatusMsg("Updating leaderboard...");
-            console.log("[Contract] Calling updateResult.tx with CID:", newCid, "points:", pts);
-            const updateTx = await withTimeout(
-                lb.updateResult.tx(
-                    newCid,
-                    BigInt(pts),
-                    { signer: account.getSigner(), origin: account.address },
-                ),
-                120_000, "updateResult.tx",
-            );
-            console.log("[Contract] updateResult.tx result:", updateTx);
-
-            setStatusMsg("Saved!");
-            console.log("[Contract] All saved successfully!");
-        } catch (err) {
-            console.error("Save error:", err);
-            setStatusMsg("Failed to save - check console");
-        } finally {
-            setSaving(false);
-        }
     };
 
     return (
@@ -169,18 +83,16 @@ export default function SoloGame({ account, onDone }: {
             )}
 
             {!gameOver && !currentRound && (
-                <>
-                    <div className="move-picker">
-                        {(["rock", "paper", "scissors"] as Move[]).map(m => (
-                            <div key={m}>
-                                <button className="move-btn" onClick={() => pickMove(m)}>
-                                    {MOVE_EMOJI[m]}
-                                </button>
-                                <div className="move-label">{m}</div>
-                            </div>
-                        ))}
-                    </div>
-                </>
+                <div className="move-picker">
+                    {(["rock", "paper", "scissors"] as Move[]).map(m => (
+                        <div key={m}>
+                            <button className="move-btn" onClick={() => pickMove(m)}>
+                                {MOVE_EMOJI[m]}
+                            </button>
+                            <div className="move-label">{m}</div>
+                        </div>
+                    ))}
+                </div>
             )}
 
             {gameOver && (
@@ -201,17 +113,10 @@ export default function SoloGame({ account, onDone }: {
                         ))}
                     </div>
 
-                    {statusMsg && <div className="status">{statusMsg}</div>}
+                    {saved && <div className="status" style={{ color: "var(--success)" }}>Saved to local storage</div>}
 
                     <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
-                        <button
-                            className="btn btn-primary"
-                            onClick={saveToChain}
-                            disabled={saving}
-                        >
-                            {saving ? "Saving..." : "Save to Chain"}
-                        </button>
-                        <button className="btn btn-ghost" onClick={onDone}>
+                        <button className="btn btn-primary" onClick={onDone}>
                             Home
                         </button>
                     </div>

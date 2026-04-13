@@ -10,9 +10,6 @@ export interface Round {
 
 export interface GameData {
     id: number;
-    mode: "solo" | "multiplayer";
-    opponent: string; // "computer" or player address
-    roomCode?: string;
     rounds: Round[];
     result: RoundResult;
     pointsChange: number;
@@ -20,17 +17,11 @@ export interface GameData {
 }
 
 export interface PlayerData {
-    player: string; // h160 address
+    player: string;
     totalGames: number;
     wins: number;
     losses: number;
     draws: number;
     points: number;
     games: GameData[];
-}
-
-export interface LeaderboardEntry {
-    address: string;
-    points: number;
-    rank: number;
 }

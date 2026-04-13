@@ -1,11 +1,9 @@
 import { useState, useEffect } from "react";
 import { SignerManager, type SignerState } from "@polkadot-apps/signer";
-import { BulletinClient } from "@polkadot-apps/bulletin";
-import { createCdm } from "@dotdm/cdm";
-import type { Move, RoundResult } from "./types.ts";
+import type { Move, RoundResult, PlayerData, GameData } from "./types.ts";
 
 // ---------------------------------------------------------------------------
-// Signer Manager
+// Signer Manager (Host API)
 // ---------------------------------------------------------------------------
 
 export const signerManager = new SignerManager({ dappName: "rps-game" });
@@ -17,90 +15,10 @@ export function useSignerState(): SignerState {
 }
 
 // ---------------------------------------------------------------------------
-// CDM
-// ---------------------------------------------------------------------------
-
-// cdm.json will be created after `cdm deploy`
-// For now we use a placeholder that will be replaced
-let _cdm: ReturnType<typeof createCdm> | null = null;
-let _contract: any = null;
-
-export function initCdm(cdmJson: any) {
-    _cdm = createCdm(cdmJson);
-    _contract = _cdm.getContract("@example/leaderboard") as any;
-}
-
-export function getCdm() {
-    return _cdm!;
-}
-
-export function getContract() {
-    return _contract!;
-}
-
-// ---------------------------------------------------------------------------
-// Bulletin
-// ---------------------------------------------------------------------------
-
-let _bulletinClient: BulletinClient | null = null;
-
-export async function getBulletinClient() {
-    if (!_bulletinClient) _bulletinClient = await BulletinClient.create("paseo");
-    return _bulletinClient;
-}
-
-export async function uploadToBulletin(bytes: Uint8Array): Promise<string> {
-    const client = await getBulletinClient();
-    const result = await client.upload(bytes);
-    console.log("[Bulletin] Upload complete. CID:", result.cid);
-    return result.cid;
-}
-
-// ---------------------------------------------------------------------------
-// Account mapping
-// ---------------------------------------------------------------------------
-
-const _mappedAccounts = new Set<string>();
-
-export async function ensureMapping(account: { address: string; getSigner: () => any }) {
-    if (!_cdm) return;
-    if (_mappedAccounts.has(account.address)) return;
-    try {
-        const mapped = await _cdm.inkSdk.addressIsMapped(account.address);
-        if (mapped) {
-            _mappedAccounts.add(account.address);
-            return;
-        }
-        console.log("[Mapping] Mapping account:", account.address);
-        const api = _cdm.client.getUnsafeApi() as any;
-        const tx = api.tx.Revive.map_account();
-        await tx.signAndSubmit(account.getSigner());
-        _mappedAccounts.add(account.address);
-    } catch (err) {
-        console.warn("[Mapping] Error:", err);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-export const IPFS_GATEWAY = "https://paseo-ipfs.polkadot.io/ipfs/";
-
-// ---------------------------------------------------------------------------
-// Helpers
+// Game helpers
 // ---------------------------------------------------------------------------
 
 export const short = (addr: string) => addr.slice(0, 6) + "..." + addr.slice(-4);
-
-export async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-    return Promise.race([
-        promise,
-        new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)
-        ),
-    ]);
-}
 
 export function determineWinner(player: Move, opponent: Move): RoundResult {
     if (player === opponent) return "draw";
@@ -126,11 +44,37 @@ export function randomMove(): Move {
     return MOVES[Math.floor(Math.random() * 3)];
 }
 
-export function generateRoomCode(): string {
-    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let code = "";
-    for (let i = 0; i < 6; i++) {
-        code += chars[Math.floor(Math.random() * chars.length)];
-    }
-    return code;
+// ---------------------------------------------------------------------------
+// LocalStorage persistence
+// ---------------------------------------------------------------------------
+
+const STORAGE_PREFIX = "rps-game:";
+
+export function loadPlayerData(address: string): PlayerData {
+    try {
+        const raw = localStorage.getItem(STORAGE_PREFIX + address);
+        if (raw) return JSON.parse(raw);
+    } catch { /* fall through */ }
+    return {
+        player: address,
+        totalGames: 0, wins: 0, losses: 0, draws: 0, points: 0,
+        games: [],
+    };
+}
+
+export function savePlayerData(data: PlayerData) {
+    localStorage.setItem(STORAGE_PREFIX + data.player, JSON.stringify(data));
+}
+
+export function appendGame(address: string, game: Omit<GameData, "id">): PlayerData {
+    const data = loadPlayerData(address);
+    const fullGame: GameData = { ...game, id: data.games.length + 1 };
+    data.games.push(fullGame);
+    data.totalGames++;
+    if (game.result === "win") data.wins++;
+    else if (game.result === "loss") data.losses++;
+    else data.draws++;
+    data.points += game.pointsChange;
+    savePlayerData(data);
+    return data;
 }
