@@ -1,51 +1,14 @@
 import { useState, useEffect, useRef } from "react";
-import {
-    createStatementStore,
-    type ProductAccountId,
-    type SignedStatement,
-    type Statement,
-    type Topic,
-} from "@novasamatech/product-sdk";
-import { blake2b256 } from "@polkadot-labs/hdkd-helpers";
+import { StatementStoreClient } from "@polkadot-apps/statement-store";
 import { generateRoomCode } from "../utils.ts";
 
-function stringToTopic(str: string): Uint8Array {
-    return blake2b256(new TextEncoder().encode(str));
-}
-
-// Single store instance — same pattern as meet repro page
-const store = createStatementStore();
-
-const APP_TOPIC = "rps-game";
-const ACCOUNT_ID: ProductAccountId = ["rps-game.dot", 0];
-
-interface GameMessage {
-    type: string;
+interface JoinMessage {
+    type: "join";
     peerId: string;
     timestamp: number;
 }
 
-async function submitStatement(roomCode: string, channel: string, msg: GameMessage) {
-    const data = new TextEncoder().encode(JSON.stringify(msg));
-    const expiryTimestampSecs = Math.floor(Date.now() / 1000) + 600;
-    const seq = Date.now() % 0xFFFFFFFF;
-    const expiry = (BigInt(expiryTimestampSecs) << BigInt(32)) | BigInt(seq);
-
-    const statement = {
-        proof: undefined,
-        decryptionKey: stringToTopic(roomCode),
-        expiry,
-        channel: stringToTopic(channel),
-        topics: [stringToTopic(APP_TOPIC), stringToTopic(roomCode)],
-        data,
-    };
-
-    console.log("[Lobby] Creating proof...");
-    const proof = await store.createProof(ACCOUNT_ID, statement as any);
-    console.log("[Lobby] Proof created, submitting...");
-    await store.submit({ ...statement, proof } as any);
-    console.log("[Lobby] Submitted!");
-}
+const APP_NAME = "rps-game";
 
 export default function MultiplayerLobby({ account, onGameStart, onBack }: {
     account: { address: string; h160Address: string; publicKey: Uint8Array; getSigner: () => any };
@@ -57,10 +20,14 @@ export default function MultiplayerLobby({ account, onGameStart, onBack }: {
     const [joinCode, setJoinCode] = useState("");
     const [waiting, setWaiting] = useState(false);
     const [statusMsg, setStatusMsg] = useState("");
-    const subRef = useRef<{ unsubscribe: () => void } | null>(null);
+    const clientRef = useRef<StatementStoreClient | null>(null);
 
     useEffect(() => {
-        return () => { subRef.current?.unsubscribe(); };
+        return () => {
+            console.log("[Lobby] Cleanup");
+            clientRef.current?.destroy();
+            clientRef.current = null;
+        };
     }, []);
 
     const createRoom = async () => {
@@ -72,42 +39,40 @@ export default function MultiplayerLobby({ account, onGameStart, onBack }: {
         setStatusMsg("Creating room...");
 
         try {
-            // Subscribe first — identical to meet repro page pattern
-            const topics = [stringToTopic(APP_TOPIC), stringToTopic(code)];
-            console.log("[Lobby] Subscribing...");
+            const client = new StatementStoreClient({
+                appName: APP_NAME,
+                defaultTtlSeconds: 600,
+            });
+            clientRef.current = client;
 
-            subRef.current = store.subscribe(topics as any, (statements: any[]) => {
-                console.log("[Lobby] Received", statements.length, "statement(s)");
-                for (const stmt of statements) {
-                    try {
-                        if (!stmt.data) continue;
-                        const text = new TextDecoder().decode(stmt.data);
-                        console.log("[Lobby] Data:", text);
-                        const msg: GameMessage = JSON.parse(text);
+            console.log("[Lobby] Connecting in host mode...");
+            await client.connect({
+                mode: "host",
+                accountId: ["rps-game.dot", 0],
+            });
+            console.log("[Lobby] Connected");
 
-                        if (msg.peerId === account.h160Address) {
-                            console.log("[Lobby] Own message, skipping");
-                            continue;
-                        }
-
-                        console.log("[Lobby] >>> Opponent joined:", msg.peerId);
-                        setStatusMsg("Opponent found! Starting game...");
-                        setTimeout(() => {
-                            subRef.current?.unsubscribe();
-                            subRef.current = null;
-                            onGameStart(code, true);
-                        }, 500);
-                    } catch (e) {
-                        console.warn("[Lobby] Parse error:", e);
-                    }
+            // Subscribe for opponent join
+            client.subscribe<JoinMessage>((stmt) => {
+                console.log("[Lobby] Statement received:", stmt.data);
+                if (stmt.data.type === "join" && stmt.data.peerId !== account.h160Address) {
+                    console.log("[Lobby] >>> Opponent found:", stmt.data.peerId);
+                    setStatusMsg("Opponent found! Starting game...");
+                    setTimeout(() => {
+                        client.destroy();
+                        clientRef.current = null;
+                        onGameStart(code, true);
+                    }, 500);
                 }
-            });
+            }, { topic2: code });
 
-            // Then publish
-            console.log("[Lobby] Publishing join for:", account.h160Address);
-            await submitStatement(code, `${code}/presence/${account.h160Address}`, {
-                type: "join", peerId: account.h160Address, timestamp: Date.now(),
-            });
+            // Publish presence
+            console.log("[Lobby] Publishing join...");
+            const ok = await client.publish<JoinMessage>(
+                { type: "join", peerId: account.h160Address, timestamp: Date.now() },
+                { channel: `${code}/presence/${account.h160Address}`, topic2: code },
+            );
+            console.log("[Lobby] Publish:", ok);
 
             setStatusMsg("Waiting for opponent...");
         } catch (err) {
@@ -127,12 +92,29 @@ export default function MultiplayerLobby({ account, onGameStart, onBack }: {
         setStatusMsg("Joining room...");
 
         try {
-            await submitStatement(code, `${code}/presence/${account.h160Address}`, {
-                type: "join", peerId: account.h160Address, timestamp: Date.now(),
+            const client = new StatementStoreClient({
+                appName: APP_NAME,
+                defaultTtlSeconds: 600,
+            });
+            clientRef.current = client;
+
+            await client.connect({
+                mode: "host",
+                accountId: ["rps-game.dot", 0],
             });
 
+            console.log("[Lobby] Publishing join...");
+            await client.publish<JoinMessage>(
+                { type: "join", peerId: account.h160Address, timestamp: Date.now() },
+                { channel: `${code}/presence/${account.h160Address}`, topic2: code },
+            );
+
             setStatusMsg("Joined! Starting game...");
-            setTimeout(() => onGameStart(code, false), 500);
+            setTimeout(() => {
+                client.destroy();
+                clientRef.current = null;
+                onGameStart(code, false);
+            }, 500);
         } catch (err) {
             console.error("[Lobby] Error:", err);
             setStatusMsg("Failed: " + (err instanceof Error ? err.message : String(err)));
