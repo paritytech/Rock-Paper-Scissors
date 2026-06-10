@@ -118,8 +118,42 @@ export function useAccountState(): AccountState {
     return state;
 }
 
+// DEV-ONLY: run the whole app in a plain browser (no Polkadot host, no deploy,
+// no phone, no funding) via `?mock`. The account is stubbed here and the
+// leaderboard contract is backed by an in-memory store (see createDevLeaderboard),
+// so register / Solo play / leaderboard / profile all work end-to-end. Gated at
+// the call site by `import.meta.env.DEV`, so the whole branch is stripped from
+// production builds by Vite/esbuild.
+function maybeMockAccount(): AppAccount | null {
+    if (typeof window === "undefined" || !window.location.search.includes("mock")) return null;
+    const publicKey = new Uint8Array(32).fill(7);
+    const stubSigner = { publicKey } as unknown as PolkadotSigner;
+    const address = "5MockDevAccount0000000000000000000000000000000000";
+    return {
+        address,
+        h160Address: "0x000000000000000000000000000000000000dev0",
+        publicKey,
+        name: "Dev (mock)",
+        signer: stubSigner,
+        productAccountId: ["localhost-mock", 0],
+        productAccount: { dotNsIdentifier: "localhost-mock", derivationIndex: 0, publicKey } as ProductAccount,
+        getSigner: () => stubSigner,
+    };
+}
+
 export async function connectAccount(): Promise<void> {
     if (_state.status === "connecting") return;
+
+    if (import.meta.env.DEV) {
+        const mock = maybeMockAccount();
+        if (mock) {
+            _devMode = true;
+            console.warn("[Account] DEV mock account (?mock) — in-memory leaderboard, no chain/phone/deploy");
+            setState({ status: "ready", account: mock });
+            return;
+        }
+    }
+
     setState({ status: "connecting", account: null });
 
     try {
@@ -228,8 +262,16 @@ export function calculateCID(bytes: Uint8Array): string {
 }
 
 export async function uploadToBulletin(_account: AppAccount, bytes: Uint8Array): Promise<string> {
-    await ensurePermission("PreimageSubmit");
     const cid = calculateCID(bytes);
+    if (_devMode) {
+        // No host in dev mode. calculateCID is pure, so Solo's "upload then store
+        // the CID" flow works without a Bulletin submit; stash the bytes locally so
+        // fetchFromGateway can serve them back and history reads stay offline too.
+        devBlobPut(cid, bytes);
+        console.warn("[Bulletin] DEV mode — stored locally, returning CID:", cid);
+        return cid;
+    }
+    await ensurePermission("PreimageSubmit");
     console.log("[Bulletin] Submitting preimage via host, size:", bytes.length, "expected CID:", cid);
     await preimageManager.submit(bytes);
     console.log("[Bulletin] Preimage stored.");
@@ -244,6 +286,78 @@ export async function uploadToBulletin(_account: AppAccount, bytes: Uint8Array):
 let _contractManager: ContractManager | null = null;
 let _contract: any = null;
 let _polkadotClient: ReturnType<typeof createClient> | null = null;
+
+// Set true when the `?mock` dev account is in use (see connectAccount). Routes
+// getContract()/ensureMapping()/uploadToBulletin() to in-memory equivalents
+// instead of the chain/host.
+let _devMode = false;
+let _devContract: any = null;
+
+// ---------------------------------------------------------------------------
+// Dev-mode leaderboard — in-memory, same method surface as the live contract
+// (register / updateResult / isRegistered / getPlayerCid / getPlayerPoints /
+// getPlayerCount / getPlayerAt). Queries return `{ success, value }` and txs
+// mutate the signing origin, exactly like the on-chain handle, so the pages need
+// zero changes. State persists in localStorage; two opponents are seeded so a
+// fresh mod shows a populated board. DEV-ONLY: only reached when `_devMode` is
+// set, which can only happen under `import.meta.env.DEV`.
+// ---------------------------------------------------------------------------
+
+const DEV_LB_KEY = "rps:dev:leaderboard";
+type DevEntry = { address: string; registered: boolean; points: number; cid: string };
+
+function loadDevState(): DevEntry[] {
+    try {
+        const raw = localStorage.getItem(DEV_LB_KEY);
+        if (raw) return JSON.parse(raw) as DevEntry[];
+    } catch { /* fall through to seed */ }
+    const seed: DevEntry[] = [
+        { address: "0x000000000000000000000000000000000000a11c", registered: true, points: 9, cid: "" },
+        { address: "0x00000000000000000000000000000000000000b0b", registered: true, points: 4, cid: "" },
+    ];
+    saveDevState(seed);
+    return seed;
+}
+
+function saveDevState(entries: DevEntry[]): void {
+    try { localStorage.setItem(DEV_LB_KEY, JSON.stringify(entries)); } catch { /* ignore */ }
+}
+
+// Dev-mode Bulletin blob store: game-history JSON is "uploaded" to localStorage
+// keyed by its (pure-computed) CID, so history reads (getPlayerCid -> fetch the
+// content) round-trip fully offline instead of hitting the real IPFS gateway.
+const DEV_BLOB_PREFIX = "rps:dev:blob:";
+function devBlobPut(cid: string, bytes: Uint8Array): void {
+    try { localStorage.setItem(DEV_BLOB_PREFIX + cid, new TextDecoder().decode(bytes)); } catch { /* ignore */ }
+}
+function devBlobGet(cid: string): Uint8Array | null {
+    try {
+        const s = localStorage.getItem(DEV_BLOB_PREFIX + cid);
+        return s == null ? null : new TextEncoder().encode(s);
+    } catch { return null; }
+}
+
+function createDevLeaderboard(): any {
+    const norm = (a: string) => a.toLowerCase();
+    const find = (addr: string) => loadDevState().find(e => norm(e.address) === norm(addr)) ?? null;
+    const upsert = (addr: string, mut: (e: DevEntry) => void) => {
+        const entries = loadDevState();
+        let e = entries.find(x => norm(x.address) === norm(addr));
+        if (!e) { e = { address: addr, registered: false, points: 0, cid: "" }; entries.push(e); }
+        mut(e);
+        saveDevState(entries);
+    };
+    const me = () => _state.account?.h160Address ?? "0x0000000000000000000000000000000000000dev";
+    return {
+        register:        { tx: async () => { upsert(me(), e => { e.registered = true; }); return { success: true }; } },
+        updateResult:    { tx: async (cid: string, delta: bigint) => { upsert(me(), e => { e.cid = cid; e.points += Number(delta); }); return { success: true }; } },
+        isRegistered:    { query: async (addr: string) => ({ success: true, value: !!find(addr)?.registered }) },
+        getPlayerCid:    { query: async (addr: string) => ({ success: true, value: find(addr)?.cid ?? "" }) },
+        getPlayerPoints: { query: async (addr: string) => ({ success: true, value: BigInt(find(addr)?.points ?? 0) }) },
+        getPlayerCount:  { query: async () => ({ success: true, value: BigInt(loadDevState().length) }) },
+        getPlayerAt:     { query: async (index: bigint) => ({ success: true, value: loadDevState()[Number(index)]?.address ?? "0x" }) },
+    };
+}
 
 /**
  * Wake the Asset Hub chain follow before a contract call. The host container
@@ -396,6 +510,7 @@ export async function initContracts(cdmJson: any): Promise<void> {
  * startup don't compete with a leaderboard chain follow.
  */
 export function getContract(): any {
+    if (_devMode) return (_devContract ??= createDevLeaderboard());
     if (!_cdmJson) return null;
     // Return a proxy that defers chain init until first method call.
     return new Proxy({}, {
@@ -493,6 +608,7 @@ async function mapAccountWithRuntime(
 // during init (before live registry resolution), so for the signed-in account this is a
 // no-op — it stays public for tx call sites (register/updateResult) as an explicit guard.
 export async function ensureMapping(account: AppAccount): Promise<void> {
+    if (_devMode) return; // no chain in dev mode — nothing to map
     if (_mappedAccounts.has(account.address)) return;
     await ensureContractsReady();
     if (!_contractManager) throw new Error("Contract manager not ready");
@@ -513,6 +629,12 @@ const GATEWAYS = [
 export const IPFS_GATEWAY = GATEWAYS[0];
 
 export async function fetchFromGateway(cid: string, timeoutMs = 30000): Promise<Uint8Array> {
+    if (_devMode) {
+        // Serve the locally-stashed blob; no real gateway in dev mode.
+        const local = devBlobGet(cid);
+        if (local) return local;
+        throw new Error(`[Bulletin] DEV mode — no local blob for ${cid}`);
+    }
     const master = new AbortController();
     const timer = setTimeout(() => master.abort(), timeoutMs);
     try {
