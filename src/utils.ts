@@ -305,9 +305,19 @@ function wrapContract(contract: any): any {
 let _cdmJson: any = null;
 let _contractInitPromise: Promise<void> | null = null;
 
+// Single source of truth for the leaderboard package name. Derived from cdm.json
+// at stage time instead of hardcoded, so a rename (e.g. `npm run name:new`) only
+// touches cdm.json — not three hand-synced string literals where a miss surfaces
+// as a silent runtime resolve failure.
+let _libraryName: string | null = null;
+
 /** Stage cdm.json without opening the Asset Hub chain client yet. */
 export function stageCdmJson(cdmJson: any): void {
     _cdmJson = cdmJson;
+    _libraryName =
+        Object.keys(cdmJson?.contracts ?? {})[0] ??
+        Object.keys(cdmJson?.dependencies ?? {})[0] ??
+        null;
 }
 
 /**
@@ -361,11 +371,12 @@ async function ensureContractsReady(): Promise<void> {
         }
 
         // Map the product account BEFORE live registry resolution. `fromLiveClient`
-        // immediately calls `registry.getAddress("@rps/leaderboard")` as a view, and
+        // immediately calls `registry.getAddress(<library>)` as a view, and
         // pallet-revive dry-run-fails that call with `Revive::AccountUnmapped` when the
         // query origin isn't mapped — surfacing as ContractLiveAddressResolutionError.
         // Build a plain runtime (no registry query) to perform the mapping first.
         // (ChainSubmit permission already granted at the top of this init.)
+        if (!_libraryName) throw new Error("[CDM] No contract package found in cdm.json");
         const initRuntime = createContractRuntimeFromClient(_polkadotClient, paseo_asset_hub);
         await mapAccountWithRuntime(initRuntime, _state.account);
 
@@ -377,10 +388,10 @@ async function ensureContractsReady(): Promise<void> {
                 defaultOrigin: _state.account.address as never,
                 defaultSigner: _state.account.signer,
                 registryOrigin: _state.account.address as never,
-                libraries: ["@rps/leaderboard"],
+                libraries: [_libraryName],
             },
         );
-        _contract = wrapContract(_contractManager.getContract("@rps/leaderboard"));
+        _contract = wrapContract(_contractManager.getContract(_libraryName));
         console.log("[CDM] Contract manager ready (live registry resolution)");
     })();
     return _contractInitPromise;

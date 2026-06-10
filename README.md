@@ -33,6 +33,24 @@ npm run dev
 ```
 Open polkadot desktop on localhost.
 
+## Modding this app — claim a unique contract name first
+
+Before you deploy your own copy, **claim a fresh contract package name**:
+
+```bash
+npm run name:new
+```
+
+The template ships a hardcoded contract package name (`@rps/leaderboard`). On the
+shared registry that name is **already owned by the original deployer's signer**,
+so `pg deploy` / `npm run deploy` fails with `already owned by 0x…` and points you
+at renaming — which collides again under the next predictable name. `npm run
+name:new` generates a high-entropy name (`@rps-<8hex>/leaderboard`) that nobody
+owns and rewrites it in `cdm.json` + `contracts/leaderboard/Cargo.toml` (the
+frontend derives the name from `cdm.json`, so there's nothing else to touch). Run
+it once when you start a mod and the ownership collision can't happen. Pass your
+own name if you prefer: `npm run name:new @me/scoreboard`.
+
 > Deploying **your own copy** (own contract, own `.dot` name, published to the
 > playground)? Follow the step-by-step [DEPLOYMENT.md](./DEPLOYMENT.md).
 
