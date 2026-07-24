@@ -13,7 +13,8 @@ import {
 } from "@parity/product-sdk-signer";
 import { createChainClient } from "@parity/product-sdk-chain-client";
 import { ContractManager, createContractRuntimeFromClient, ensureContractAccountMapped } from "@parity/product-sdk-contracts";
-import { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
+import type { devnet_asset_hub } from "@parity/product-sdk-descriptors/devnet-asset-hub";
+import type { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
 import type { PolkadotClient, PolkadotSigner } from "polkadot-api";
 import { blake2b } from "@noble/hashes/blake2.js";
 import { CID } from "multiformats/cid";
@@ -35,6 +36,67 @@ export function unwrapResult<T>(
     }
     return result.value;
 }
+
+// ---------------------------------------------------------------------------
+// Networks. "paseo-next" is the Paseo Next v2 preview network (para 1500) —
+// that's what the CDM `paseo` preset targets, NOT the public Paseo testnet.
+// "devnet" is the public products devnet on the Paseo testnet Asset Hub
+// (para 1000), with the community-operated CDM registry (reference:
+// contract-dependency-manager PR #61). Build with VITE_NETWORK=devnet to
+// select it; the default stays paseo-next. Descriptors load dynamically so
+// each build ships a single metadata chunk; chain identity comes from the
+// descriptor (host-routed chain client, no endpoints or genesis to pin).
+// ---------------------------------------------------------------------------
+
+type AssetHubDescriptor = typeof devnet_asset_hub | typeof paseo_asset_hub;
+
+interface NetworkConfig {
+    label: string;
+    /** IPFS gateways used to read Bulletin content, most specific first. */
+    gateways: readonly string[];
+    /** CDM ContractRegistry address the leaderboard resolves against. */
+    registry: string;
+    loadDescriptor(): Promise<AssetHubDescriptor>;
+}
+
+const NETWORKS: Record<"paseo-next" | "devnet", NetworkConfig> = {
+    "paseo-next": {
+        label: "Paseo Next",
+        gateways: [
+            "https://paseo-bulletin-next-ipfs.polkadot.io/ipfs/",
+            "https://dweb.link/ipfs/",
+            "https://ipfs.io/ipfs/",
+            "https://nftstorage.link/ipfs/",
+        ],
+        registry: "0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0",
+        loadDescriptor: async () =>
+            (await import("@parity/product-sdk-descriptors/paseo-asset-hub")).paseo_asset_hub,
+    },
+    // Bulletin Paseo has no dedicated HTTP gateway; devnet content is read
+    // via public IPFS gateways.
+    devnet: {
+        label: "Devnet (Paseo testnet)",
+        gateways: [
+            "https://ipfs.io/ipfs/",
+            "https://dweb.link/ipfs/",
+            "https://nftstorage.link/ipfs/",
+        ],
+        registry: "0x59b0245778917af55224e5f8fb55f7f8d452619f",
+        loadDescriptor: async () =>
+            (await import("@parity/product-sdk-descriptors/devnet-asset-hub")).devnet_asset_hub,
+    },
+};
+
+function resolveNetwork(): NetworkConfig {
+    const selected = (import.meta.env.VITE_NETWORK ?? "").trim().toLowerCase();
+    if (selected === "devnet") return NETWORKS.devnet;
+    if (selected && selected !== "paseo" && selected !== "paseo-next") {
+        console.warn(`[Network] Unknown VITE_NETWORK "${selected}", falling back to paseo-next`);
+    }
+    return NETWORKS["paseo-next"];
+}
+
+export const NETWORK = resolveNetwork();
 
 // ---------------------------------------------------------------------------
 // Permissions (RFC-0002)
@@ -341,12 +403,13 @@ async function ensureContractsReady(): Promise<void> {
         // so the host never prompts "Allow Access to Web Domains" for a raw RPC
         // endpoint, and the chain identity comes from the descriptor — no
         // hardcoded genesis.
+        const descriptor = await NETWORK.loadDescriptor();
         const chainClient = await createChainClient({
-            chains: { assetHub: paseo_asset_hub },
+            chains: { assetHub: descriptor },
         });
         const client = chainClient.raw.assetHub;
         _polkadotClient = client;
-        console.log("[CDM] Asset Hub chain client ready (host-routed)");
+        console.log(`[CDM] Asset Hub chain client ready (host-routed, ${NETWORK.label})`);
 
         console.log("[CDM] Waking Asset Hub chain follow...");
         await client.getChainSpecData();
@@ -375,18 +438,20 @@ async function ensureContractsReady(): Promise<void> {
         // query origin isn't mapped — surfacing as ContractLiveAddressResolutionError.
         // Build a plain runtime (no registry query) to perform the mapping first.
         // (ChainSubmit permission already granted at the top of this init.)
-        const initRuntime = createContractRuntimeFromClient(client, paseo_asset_hub);
+        const initRuntime = createContractRuntimeFromClient(client, descriptor);
         await mapAccountWithRuntime(initRuntime, _state.account);
 
         // Since product-sdk 0.18, fromLiveClient returns a Result instead of
-        // throwing on resolution failure.
+        // throwing on resolution failure. The registry address comes from the
+        // selected network, so devnet resolves against the devnet registry.
         const live = await ContractManager.fromLiveClient(
             _cdmJson,
             client,
-            paseo_asset_hub,
+            descriptor,
             {
                 defaultOrigin: _state.account.address as never,
                 defaultSigner: _state.account.signer,
+                registryAddress: NETWORK.registry as never,
                 registryOrigin: _state.account.address as never,
                 libraries: ["@rps/leaderboard"],
             },
@@ -522,12 +587,7 @@ export async function ensureMapping(account: AppAccount): Promise<void> {
 // Bulletin reads via public IPFS gateways
 // ---------------------------------------------------------------------------
 
-const GATEWAYS = [
-    "https://paseo-bulletin-next-ipfs.polkadot.io/ipfs/",
-    "https://dweb.link/ipfs/",
-    "https://ipfs.io/ipfs/",
-    "https://nftstorage.link/ipfs/",
-] as const;
+const GATEWAYS = NETWORK.gateways;
 
 export const IPFS_GATEWAY = GATEWAYS[0];
 
