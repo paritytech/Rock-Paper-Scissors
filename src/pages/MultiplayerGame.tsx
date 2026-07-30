@@ -5,7 +5,7 @@ import type { Move, Round, GameData, PlayerData, RoundResult } from "../types.ts
 import {
     determineWinner, pointsForResult,
     uploadToBulletin, ensureMapping, getContract, withTimeout,
-    IPFS_GATEWAY, short, asBytes20,
+    IPFS_GATEWAY, short, asBytes20, unwrapResult,
 } from "../utils.ts";
 
 const MOVE_EMOJI: Record<Move, string> = { rock: "✊", paper: "✋", scissors: "✂️" };
@@ -114,11 +114,16 @@ export default function MultiplayerGame({ account, roomCode, onDone }: {
                 phaseRef.current = "waiting-reveal";
 
                 if (myMoveRef.current && mySaltRef.current) {
-                    clientRef.current.publish<GameMessage>(
-                        { type: "reveal", round: roundRef.current, move: myMoveRef.current,
-                          salt: mySaltRef.current, peerId: myId, timestamp: Date.now() },
-                        { channel: `${roomCode}/reveal/${roundRef.current}/${myId}`, topic2: roomCode },
-                    );
+                    // Fire-and-forget send. publish() returns a Result since
+                    // product-sdk 0.18 (no throw), so surface a failure rather
+                    // than letting a dropped reveal stall the round silently.
+                    void clientRef.current
+                        .publish<GameMessage>(
+                            { type: "reveal", round: roundRef.current, move: myMoveRef.current,
+                              salt: mySaltRef.current, peerId: myId, timestamp: Date.now() },
+                            { channel: `${roomCode}/reveal/${roundRef.current}/${myId}`, topic2: roomCode },
+                        )
+                        .then(r => { if (!r.ok) setStatusMsg("Failed to send reveal: " + r.error.message); });
                 }
             }
         }
@@ -161,10 +166,12 @@ export default function MultiplayerGame({ account, roomCode, onDone }: {
                     handleMessage(msg);
                 }, { topic2: roomCode });
 
-                await client.publish<GameMessage>(
+                // publish() returns a Result since product-sdk 0.18; unwrap so
+                // a failed join reaches the catch instead of vanishing.
+                unwrapResult(await client.publish<GameMessage>(
                     { type: "join", peerId: myId, timestamp: Date.now() },
                     { channel: `${roomCode}/presence/${myId}`, topic2: roomCode },
-                );
+                ));
 
                 if (!destroyed) {
                     setPhase("pick");
@@ -193,21 +200,29 @@ export default function MultiplayerGame({ account, roomCode, onDone }: {
         mySaltRef.current = salt;
         setPickedMove(move);
 
-        await clientRef.current.publish<GameMessage>(
-            { type: "commit", round: roundRef.current, hash, peerId: myId, timestamp: Date.now() },
-            { channel: `${roomCode}/commit/${roundRef.current}/${myId}`, topic2: roomCode },
-        );
+        // publish() returns a Result since product-sdk 0.18 (no throw). Unwrap
+        // so a dropped commit/reveal surfaces to the player instead of leaving
+        // the round stuck with nothing logged.
+        try {
+            unwrapResult(await clientRef.current.publish<GameMessage>(
+                { type: "commit", round: roundRef.current, hash, peerId: myId, timestamp: Date.now() },
+                { channel: `${roomCode}/commit/${roundRef.current}/${myId}`, topic2: roomCode },
+            ));
 
-        if (opponentCommitRef.current) {
-            setPhase("waiting-reveal");
-            phaseRef.current = "waiting-reveal";
-            await clientRef.current.publish<GameMessage>(
-                { type: "reveal", round: roundRef.current, move, salt, peerId: myId, timestamp: Date.now() },
-                { channel: `${roomCode}/reveal/${roundRef.current}/${myId}`, topic2: roomCode },
-            );
-        } else {
-            setPhase("waiting-commit");
-            phaseRef.current = "waiting-commit";
+            if (opponentCommitRef.current) {
+                setPhase("waiting-reveal");
+                phaseRef.current = "waiting-reveal";
+                unwrapResult(await clientRef.current.publish<GameMessage>(
+                    { type: "reveal", round: roundRef.current, move, salt, peerId: myId, timestamp: Date.now() },
+                    { channel: `${roomCode}/reveal/${roundRef.current}/${myId}`, topic2: roomCode },
+                ));
+            } else {
+                setPhase("waiting-commit");
+                phaseRef.current = "waiting-commit";
+            }
+        } catch (err) {
+            console.error("[MPGame] publish failed:", err);
+            setStatusMsg("Failed to send move: " + (err instanceof Error ? err.message : String(err)));
         }
     };
 
