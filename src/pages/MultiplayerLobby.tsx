@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import type { AppAccount } from "../utils.ts";
 import { StatementStoreClient } from "@parity/product-sdk-statement-store";
-import { generateRoomCode } from "../utils.ts";
+import { generateRoomCode, unwrapResult } from "../utils.ts";
 
 interface JoinMessage {
     type: "join";
@@ -56,10 +56,12 @@ export default function MultiplayerLobby({ account, onGameStart }: {
                 }
             }, { topic2: code });
 
-            await client.publish<JoinMessage>(
+            // publish() returns a Result since product-sdk 0.18; unwrap so a
+            // failed publish reaches the catch below instead of vanishing.
+            unwrapResult(await client.publish<JoinMessage>(
                 { type: "join", peerId: account.h160Address, timestamp: Date.now() },
                 { channel: `${code}/presence/${account.h160Address}`, topic2: code },
-            );
+            ));
 
             setStatusMsg("Waiting for opponent...");
         } catch (err) {
@@ -89,10 +91,13 @@ export default function MultiplayerLobby({ account, onGameStart }: {
                 accountId: account.productAccountId,
             });
 
-            await client.publish<JoinMessage>(
+            // publish() returns a Result since product-sdk 0.18; unwrap so a
+            // failed join reaches the catch instead of navigating into a game
+            // the host never learned about.
+            unwrapResult(await client.publish<JoinMessage>(
                 { type: "join", peerId: account.h160Address, timestamp: Date.now() },
                 { channel: `${code}/presence/${account.h160Address}`, topic2: code },
-            );
+            ));
 
             setStatusMsg("Joined! Starting game...");
             setTimeout(() => {
