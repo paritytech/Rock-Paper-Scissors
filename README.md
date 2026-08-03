@@ -31,7 +31,16 @@ npm install
 # Dev server
 npm run dev
 ```
-Open polkadot desktop on localhost.
+
+Then run it one of two ways:
+
+- **Offline dev mode (no host, no chain) — `http://localhost:3000/?mock`.**
+  Runs the whole app against an in-memory leaderboard: register, Solo play,
+  profile and leaderboard all work in a plain browser with **no Polkadot host, no
+  deploy, no phone, no funding**. Use this to build and verify a mod before you
+  ever deploy. (Multiplayer still needs the host — it uses the Statement Store.)
+- **Against the live chain — open `http://localhost:3000` in Polkadot Desktop.**
+  Real account, real Asset Hub contract, real Bulletin uploads.
 
 > Deploying **your own copy** (own contract, own `.dot` name, published to the
 > playground)? Follow the step-by-step [DEPLOYMENT.md](./DEPLOYMENT.md).
